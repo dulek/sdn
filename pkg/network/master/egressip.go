@@ -2,6 +2,8 @@ package master
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
 	"net"
 	"sync"
 	"time"
@@ -34,9 +36,6 @@ type egressIPManager struct {
 	hostSubnetInformer           osdninformers.HostSubnetInformer
 	nodeInformer                 kcoreinformers.NodeInformer
 	cloudPrivateIPConfigInformer cloudnetworkinformerv1.CloudPrivateIPConfigInformer
-
-	cloudPrivateIPConfigCreationQueueLock sync.Mutex
-	cloudPrivateIPConfigCreationQueue     map[string]osdcnv1.CloudPrivateIPConfig
 
 	updatePending bool
 	updatedAgain  bool
@@ -74,43 +73,11 @@ func (eim *egressIPManager) Start(kubeClient kubernetes.Interface,
 	if eim.tracker.CloudEgressIP {
 		eim.cloudNetworkClient = cloudNetworkClient
 		eim.cloudPrivateIPConfigInformer = cloudPrivateIPConfigInformer
-		eim.cloudPrivateIPConfigCreationQueue = make(map[string]osdcnv1.CloudPrivateIPConfig)
-		eim.watchCloudPrivateIPConfig(cloudPrivateIPConfigInformer)
 		eim.tracker.Start(kubeClient, hostSubnetInformer, netNamespaceInformer, nodeInformer)
 		return
 	}
 
 	eim.tracker.Start(nil, hostSubnetInformer, netNamespaceInformer, nil)
-}
-
-func (eim *egressIPManager) watchCloudPrivateIPConfig(cloudPrivateIPConfigInformer cloudnetworkinformerv1.CloudPrivateIPConfigInformer) {
-	funcs := common.InformerFuncs(&osdcnv1.CloudPrivateIPConfig{}, nil, eim.handleDeleteCloudPrivateIPConfig)
-	eim.cloudPrivateIPConfigInformer.Informer().AddEventHandler(funcs)
-}
-
-func (eim *egressIPManager) handleDeleteCloudPrivateIPConfig(obj interface{}) {
-	eim.cloudPrivateIPConfigCreationQueueLock.Lock()
-	defer eim.cloudPrivateIPConfigCreationQueueLock.Unlock()
-	cloudPrivateIPConfig := obj.(*osdcnv1.CloudPrivateIPConfig)
-	// Note: we can be assured that when we receive the delete event everything
-	// must have been cleaned up on the cloud controller's side, because of the
-	// utilization of the finalizer.
-	if queuedCloudPrivateIPConfig, exists := eim.cloudPrivateIPConfigCreationQueue[cloudPrivateIPConfig.Name]; exists {
-		klog.Infof("CloudPrivateIPConfig: %s has been deleted, processing its queued creation item", cloudPrivateIPConfig.Name)
-		// Retry the creation, just in case the object has not been fully
-		// cleaned up in the API server at this point.
-		err := retry.OnError(retry.DefaultBackoff, func(err error) bool {
-			return kerrors.IsAlreadyExists(err)
-		}, func() error {
-			_, err := eim.cloudNetworkClient.CloudV1().CloudPrivateIPConfigs().Create(context.TODO(), &queuedCloudPrivateIPConfig, metav1.CreateOptions{})
-			return err
-		})
-		if err != nil {
-			klog.Errorf("Error creating queued CloudPrivateIPConfig: %s, err: %v", cloudPrivateIPConfig.Name, err)
-		} else {
-			delete(eim.cloudPrivateIPConfigCreationQueue, cloudPrivateIPConfig.Name)
-		}
-	}
 }
 
 func (eim *egressIPManager) UpdateEgressCIDRs() {
@@ -289,20 +256,12 @@ func (eim *egressIPManager) Synced() {
 
 // ClaimEgressIP will create the CloudPrivateIPConfig object. There is one
 // tricky condition which we will need to handle, namely: when moving one egress
-// IP from node A to node B. In that event: we will process the removal from
-// node A before the add to node B, this can however take a bit of time (namely:
-// the time taken for the cloud controller to process and execute the event and
-// the cloud API to perform the action). Given that CloudPrivateIPConfig is
-// keyed by IP address: we won't be able to create the assignment to node B
-// until the previous assignment to node A has been fully removed. We thus need
-// to "queue" the create event and execute it once we observe the complete
-// removal of the delete using our informer.
+// IP from node A to node B. In that event: we will attempt to patch CloudPrivateIPConfig
+// spec.node to the new value instead of creating a new object.
 func (eim *egressIPManager) ClaimEgressIP(vnid uint32, egressIP, nodeIP, sdnIP string) {
 	if !eim.tracker.CloudEgressIP {
 		return
 	}
-	eim.cloudPrivateIPConfigCreationQueueLock.Lock()
-	defer eim.cloudPrivateIPConfigCreationQueueLock.Unlock()
 	if nodeName := eim.tracker.GetNodeNameByNodeIP(nodeIP); nodeName != "" {
 		cloudPrivateIPConfig := osdcnv1.CloudPrivateIPConfig{
 			ObjectMeta: metav1.ObjectMeta{
@@ -314,8 +273,23 @@ func (eim *egressIPManager) ClaimEgressIP(vnid uint32, egressIP, nodeIP, sdnIP s
 		}
 		if existingCloudPrivateIPConfig, err := eim.cloudNetworkClient.CloudV1().CloudPrivateIPConfigs().Create(context.TODO(), &cloudPrivateIPConfig, metav1.CreateOptions{}); err != nil {
 			if kerrors.IsAlreadyExists(err) && existingCloudPrivateIPConfig.Spec.Node != nodeName {
-				klog.Infof("CloudPrivateIPConfig: %s is being moved and still exists, enqueuing its creation", egressIP)
-				eim.cloudPrivateIPConfigCreationQueue[egressIP] = cloudPrivateIPConfig
+				if existingCloudPrivateIPConfig.DeletionTimestamp == nil {
+					// I don't think this can normally happen. If it can, that's where we'd be queuing the create call.
+					klog.Errorf("Error creating CloudPrivateIPConfig: %s, err: EgressIP is being deleted", egressIP)
+				}
+				klog.Infof("CloudPrivateIPConfig: %s is being moved and still exists, updating it", egressIP)
+
+				patch := []struct {
+					Op    string `json:"op"`
+					Path  string `json:"path"`
+					Value string `json:"value"`
+				}{{Op: "replace", Path: "/spec/node", Value: nodeName}}
+
+				patchBytes, _ := json.Marshal(patch)
+				_, err := eim.cloudNetworkClient.CloudV1().CloudPrivateIPConfigs().Patch(context.TODO(), egressIP, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+				if err != nil {
+					klog.Errorf("Error patching CloudPrivateIPConfig: %s, err: %v", egressIP, err)
+				}
 			} else {
 				klog.Errorf("Error creating CloudPrivateIPConfig: %s, err: %v", egressIP, err)
 			}
@@ -323,25 +297,18 @@ func (eim *egressIPManager) ClaimEgressIP(vnid uint32, egressIP, nodeIP, sdnIP s
 	}
 }
 
-// ReleaseEgressIP will delete the CloudPrivateIPConfig object, essentially
-// un-assigning the egressIP from the node associated with nodeIP, in the cloud.
-// We however need to cancel any item on the creation queue if it is being
-// deleted. This would technically mean that the egress IP we are waiting on for
-// assignment has already been deleted from the existing node, which might be
-// probable during an upgrade where all nodes are rebooted sequentially and any
-// egress IP assignment might not last very long.
+// ReleaseEgressIP is a no-op on the master side as we'll do everything in TerminateEgressIP.
 func (eim *egressIPManager) ReleaseEgressIP(egressIP, nodeIP string) {
+}
+
+// TerminateEgressIP will delete the CloudPrivateIPConfig object, essentially
+// un-assigning the egressIP from the node associated with nodeIP, in the cloud.
+func (eim *egressIPManager) TerminateEgressIP(egressIP string) {
 	if !eim.tracker.CloudEgressIP {
 		return
 	}
-	eim.cloudPrivateIPConfigCreationQueueLock.Lock()
-	defer eim.cloudPrivateIPConfigCreationQueueLock.Unlock()
 	if err := eim.cloudNetworkClient.CloudV1().CloudPrivateIPConfigs().Delete(context.TODO(), egressIP, metav1.DeleteOptions{}); err != nil {
 		klog.Errorf("Error deleting CloudPrivateIPConfig: %s, err: %v", egressIP, err)
-	}
-	if _, exists := eim.cloudPrivateIPConfigCreationQueue[egressIP]; exists {
-		klog.Infof("Processing removal for CloudPrivateIPConfig: %s, deleting it's queued creation item", egressIP)
-		delete(eim.cloudPrivateIPConfigCreationQueue, egressIP)
 	}
 }
 

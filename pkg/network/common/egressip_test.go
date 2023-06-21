@@ -31,6 +31,10 @@ func (w *testEIPWatcher) ReleaseEgressIP(egressIP, nodeIP string) {
 	w.changes = append(w.changes, fmt.Sprintf("release %s on %s", egressIP, nodeIP))
 }
 
+func (w *testEIPWatcher) TerminateEgressIP(egressIP string) {
+	w.changes = append(w.changes, fmt.Sprintf("terminate %s", egressIP))
+}
+
 func (w *testEIPWatcher) SetNamespaceEgressNormal(vnid uint32) {
 	w.changes = append(w.changes, fmt.Sprintf("namespace %d normal", int(vnid)))
 }
@@ -148,6 +152,7 @@ func TestEgressIP(t *testing.T) {
 	})
 	err = w.assertChanges(
 		"namespace 42 dropped",
+		"terminate 172.17.0.100", // No host available, so terminate called.
 	)
 	if err != nil {
 		t.Fatalf("%v", err)
@@ -177,7 +182,10 @@ func TestEgressIP(t *testing.T) {
 		Subnet:    "10.128.0.0/23",
 		EgressIPs: []osdnv1.HostSubnetEgressIP{"172.17.0.105"},
 	})
-	err = w.assertNoChanges()
+	err = w.assertChanges(
+		"terminate 172.17.0.101",
+		"terminate 172.17.0.105", // No namespaces us it, so 2 terminates
+	)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -214,6 +222,7 @@ func TestEgressIP(t *testing.T) {
 		EgressIPs: []osdnv1.NetNamespaceEgressIP{"172.17.0.104"},
 	})
 	err = w.assertChanges(
+		"terminate 172.17.0.104",
 		"namespace 44 dropped",
 	)
 	if err != nil {
@@ -226,6 +235,7 @@ func TestEgressIP(t *testing.T) {
 		EgressIPs: []osdnv1.HostSubnetEgressIP{"172.17.0.102", "172.17.0.104"}, // Added .102, .104
 	})
 	err = w.assertChanges(
+		"terminate 172.17.0.102", // .102 is new, terminate called
 		"claim 172.17.0.104 on 172.17.0.4 for namespace 44",
 		"namespace 44 via 172.17.0.104 on 172.17.0.4",
 	)
@@ -253,7 +263,10 @@ func TestEgressIP(t *testing.T) {
 		Subnet:    "10.128.0.0/23",
 		EgressIPs: []osdnv1.HostSubnetEgressIP{"172.17.0.102", "172.17.0.103"}, // Added .103, Dropped .104
 	})
-	err = w.assertNoChanges()
+	err = w.assertChanges(
+		"terminate 172.17.0.103", // .103 is new, terminate called
+		"terminate 172.17.0.104", // .104 is dropped
+	)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -362,6 +375,7 @@ func TestMultipleNamespaceEgressIPs(t *testing.T) {
 	})
 	err := w.assertChanges(
 		// after UpdateNamespaceEgress()
+		"terminate 172.17.0.100",
 		"namespace 42 dropped",
 		// after UpdateHostSubnetEgress()
 		"claim 172.17.0.100 on 172.17.0.3 for namespace 42",
@@ -376,7 +390,9 @@ func TestMultipleNamespaceEgressIPs(t *testing.T) {
 		NetID:     42,
 		EgressIPs: []osdnv1.NetNamespaceEgressIP{"172.17.0.101", "172.17.0.100"},
 	})
-	err = w.assertNoChanges()
+	err = w.assertChanges(
+		"terminate 172.17.0.101", //.101 unused.
+	)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -413,6 +429,7 @@ func TestMultipleNamespaceEgressIPs(t *testing.T) {
 		EgressIPs: []osdnv1.HostSubnetEgressIP{"172.17.0.200"},
 	})
 	err = w.assertChanges(
+		"terminate 172.17.0.200", // .200 is new, so terminate called
 		"release 172.17.0.101 on 172.17.0.4",
 		"namespace 42 via 172.17.0.100 on 172.17.0.3",
 	)
@@ -2033,6 +2050,10 @@ func TestManualEgressAllocationRespectingCapacity(t *testing.T) {
 	err = w.assertChanges(
 		"namespace 100 dropped",
 		"namespace 101 dropped",
+		"terminate 172.17.0.101",
+		"terminate 172.17.0.103",
+		"terminate 172.17.0.102",
+		"terminate 172.17.0.104",
 	)
 	if err != nil {
 		t.Fatalf("%v", err)

@@ -260,6 +260,10 @@ func (eip *egressIPWatcher) ReleaseEgressIP(egressIP, nodeIP string) {
 	}
 }
 
+// TerminateEgressIP is a noop on the node side as we do everything in RelaseEgressIP.
+func (eip *egressIPWatcher) TerminateEgressIP(egressIP string) {
+}
+
 func (eip *egressIPWatcher) addEgressIP(nodeIP, egressIP, sdnIP string) {
 	eip.monitorNodesLock.Lock()
 	defer eip.monitorNodesLock.Unlock()

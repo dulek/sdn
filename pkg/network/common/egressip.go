@@ -98,6 +98,7 @@ type EgressIPWatcher interface {
 
 	ClaimEgressIP(vnid uint32, egressIP, nodeIP, sdnIP string)
 	ReleaseEgressIP(egressIP, nodeIP string)
+	TerminateEgressIP(egressIP string)
 
 	SetNamespaceEgressNormal(vnid uint32)
 	SetNamespaceEgressDropped(vnid uint32)
@@ -635,14 +636,18 @@ func (eit *EgressIPTracker) syncEgressIPs() {
 }
 
 func (eit *EgressIPTracker) syncEgressNodeState(eg *egressIPInfo, active bool) {
+	//klog.Errorf("syncEgressNodeState: %#v, %#v", eg, active)
 	if active && eg.assignedNodeIP != eg.nodes[0].nodeIP {
 		klog.V(4).Infof("Assigning egress IP %s to node %s", eg.ip, eg.nodes[0].nodeIP)
 		eg.assignedNodeIP = eg.nodes[0].nodeIP
 		eit.watcher.ClaimEgressIP(eg.namespaces[0].vnid, eg.ip, eg.assignedNodeIP, eg.nodes[0].sdnIP)
 	} else if !active && eg.assignedNodeIP != "" {
-		klog.V(4).Infof("Removing egress IP %s from node %s", eg.ip, eg.assignedNodeIP)
+		klog.V(4).Infof("Moving egress IP %s from node %s to another node", eg.ip, eg.assignedNodeIP)
 		eit.watcher.ReleaseEgressIP(eg.ip, eg.assignedNodeIP)
 		eg.assignedNodeIP = ""
+	} else if !active && eg.assignedNodeIP == "" {
+		eit.watcher.TerminateEgressIP(eg.ip)
+		klog.V(4).Infof("Removing egress IP %s from node %s", eg.ip, eg.assignedNodeIP)
 	}
 
 	if eg.assignedNodeIP == "" {
